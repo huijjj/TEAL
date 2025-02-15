@@ -17,6 +17,7 @@ The current release supports:
 
 ## News
 
+- [01/2025] 🔥 TEAL is accepted to ICLR 2025 as a Spotlight!
 - [08/2024] 🔥 Arxiv release!
 
 ## Abstract
