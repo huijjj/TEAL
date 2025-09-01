@@ -142,6 +142,94 @@ def splitk_sparse_gemv(
     return output
 
 
+@triton.autotune(configs=[
+    triton.Config({"BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64}, num_stages=3, num_warps=8),
+    triton.Config({"BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32}, num_stages=5, num_warps=2),
+    triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}, num_stages=5, num_warps=2),
+], key=["M", "N", "K"])
+@triton.jit
+def splitk_sparse_gemm_kernel(
+    x_ptr, # [M, K]
+    w_ptr, # [N, K]
+    o_ptr, # [M, N]
+    threshold,
+    M, N, K,
+    x_M_stride, x_K_stride,
+    w_N_stride, w_K_stride,
+    o_M_stride, o_N_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    PID = tl.program_id(0)
+    num_blocks_along_N = tl.cdiv(N, BLOCK_SIZE_N)
+    
+    block_start_M = (PID//num_blocks_along_N)*BLOCK_SIZE_M
+    M_offset = (block_start_M + tl.arange(0, BLOCK_SIZE_M))
+    M_mask = M_offset < M
+
+    block_start_N = (PID%num_blocks_along_N)*BLOCK_SIZE_N
+    N_offset = (block_start_N + tl.arange(0, BLOCK_SIZE_N))
+    N_mask = N_offset < N
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        K_offset = (k*BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K))
+        K_mask = K_offset < K
+
+        x_block = tl.load(x_ptr + M_offset[:, None]*x_M_stride + K_offset[None,:]*x_K_stride, mask=(M_mask[:, None] & K_mask[None,:]), other=0.0) # [BLOCK_SIZE_M, BLOCK_SIZE_K]
+        idx = tl.abs(x_block.sum(axis=0)) > threshold # [BLOCK_SIZE_K]
+
+        w_block = tl.load(w_ptr + N_offset[:, None]*w_N_stride + K_offset[None, :]*w_K_stride, mask=(N_mask[:, None] & (K_mask & idx)[None, :]), other=0.0)
+        
+        acc = tl.dot(x_block, w_block.T, acc=acc)
+
+    tl.store(o_ptr + M_offset[:, None]*o_M_stride + N_offset[None, :]*o_N_stride, acc.to(tl.bfloat16), mask=(M_mask[:, None] & N_mask[None, :]))
+
+
+def splitk_sparse_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    threshold: float,
+    sparsity_bin: int
+):
+    # Compute y = sparse(X) @ weight.
+    # :param x: input tensor [BS, 1, Z]
+    # :param weight: weight matrix [N, Z]
+    # :param threshold: threshold for the absolute value of x
+    # :param sparsity_bin: sparsity level to get tuned kernel
+    # :return: result tensor y
+
+    N, K = weight.shape
+    BS, SL, _ = x.shape
+    assert x.shape[2] == K
+    assert SL == 1
+    x = x.view(-1, K)
+    
+    # assert weight.stride(1) > 1, "weight should be column major"
+
+    output = torch.empty(BS*SL, N, device=x.device, dtype=x.dtype)
+
+    grid = lambda meta: (triton.cdiv(BS*SL, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
+    splitk_sparse_gemm_kernel[grid](
+        x,
+        weight,
+        output,
+        threshold,
+        BS*SL, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        output.stride(0), output.stride(1),
+        BS
+    )
+
+    return output.reshape(BS, SL, -1)
+
 # fused implementation of qkv with three thresholds
 # is unnecessary for uniform but is needed for block-wise greedy
 @triton.autotune(
@@ -237,6 +325,103 @@ def qkv_gemv(
     return output
 
 
+@triton.autotune(configs=[
+    triton.Config({"BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64}, num_stages=3, num_warps=8),
+    triton.Config({"BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32}, num_stages=5, num_warps=2),
+    triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}, num_stages=5, num_warps=2),
+], key=["M", "N", "K"])
+@triton.jit
+def qkv_gemm_kernel(
+    x_ptr, # [M, K]
+    w_ptr, # [N, K]
+    o_ptr, # [M, N]
+    threshold_q,
+    threshold_k,
+    threshold_v,
+    M, N, K,
+    N_q, N_kv,
+    x_M_stride, x_K_stride,
+    w_N_stride, w_K_stride,
+    o_M_stride, o_N_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    PID = tl.program_id(0)
+    num_blocks_along_N = tl.cdiv(N, BLOCK_SIZE_N)
+    
+    block_start_M = (PID//num_blocks_along_N)*BLOCK_SIZE_M
+    M_offset = (block_start_M + tl.arange(0, BLOCK_SIZE_M))
+    M_mask = M_offset < M
+
+    block_start_N = (PID%num_blocks_along_N)*BLOCK_SIZE_N
+    N_offset = (block_start_N + tl.arange(0, BLOCK_SIZE_N))
+    N_mask = N_offset < N
+
+    is_q = N_offset < N_q
+    is_v = N_q + N_kv <= N_offset
+    threshold = tl.full((BLOCK_SIZE_M,), threshold_k, dtype=tl.bfloat16)
+    threshold = tl.where(is_q, threshold_q, threshold)
+    threshold = tl.where(is_v, threshold_v, threshold)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        K_offset = (k*BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K))
+        K_mask = K_offset < K
+
+        x_block = tl.load(x_ptr + M_offset[:, None]*x_M_stride + K_offset[None,:]*x_K_stride, mask=(M_mask[:, None] & K_mask[None,:]), other=0.0) # [BLOCK_SIZE_M, BLOCK_SIZE_K]
+        idx = tl.abs(x_block.sum(axis=0)) > threshold # [BLOCK_SIZE_K]
+
+        w_block = tl.load(w_ptr + N_offset[:, None]*w_N_stride + K_offset[None, :]*w_K_stride, mask=(N_mask[:, None] & (K_mask & idx)[None, :]), other=0.0)
+        
+        acc = tl.dot(x_block, w_block.T, acc=acc)
+
+    tl.store(o_ptr + M_offset[:, None]*o_M_stride + N_offset[None, :]*o_N_stride, acc.to(tl.bfloat16), mask=(M_mask[:, None] & N_mask[None, :]))
+
+
+
+def qkv_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    threshold_q: float,
+    threshold_k: float,
+    threshold_v: float,
+    sparsity_bin: int,
+    kv_size: int
+):
+    N, K = weight.shape
+    BS, SL, _ = x.shape
+    assert x.shape[2] == K
+    assert SL == 1
+    x = x.view(-1, K)
+    
+    # assert weight.stride(1) > 1, "weight should be column major"
+
+    output = torch.empty(BS*SL, N, device=x.device, dtype=x.dtype)
+
+    grid = lambda meta: (triton.cdiv(BS*SL, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
+    qkv_gemm_kernel[grid](
+        x,
+        weight,
+        output,
+        threshold_q,
+        threshold_k,
+        threshold_v,
+        BS*SL, N, K,
+        N - 2*kv_size, kv_size,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        output.stride(0), output.stride(1),
+        BS
+    )
+
+    return output.reshape(BS, SL, -1)
+
+
 import sys
 import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -268,8 +453,8 @@ class SparseGEMV(BaseKernel):
         threshold: float,
         sparsity_bin: int,
     ) -> torch.Tensor:
-        return splitk_sparse_gemv(hidden_states, weights, threshold, sparsity_bin) if hidden_states.shape[1] == 1 else torch.matmul(hidden_states, weights.T) 
-        # this will incur some prefill overhead since weights are column major
+        return splitk_sparse_gemv(hidden_states, weights, threshold, sparsity_bin) if hidden_states.shape[1] == 1 else splitk_sparse_gemm(hidden_states, weights, threshold, sparsity_bin)
+
 
 from typing import Tuple
 class SparseQKVGEMV(BaseKernel):
@@ -295,7 +480,8 @@ class SparseQKVGEMV(BaseKernel):
         sparsity_bin: int,
         kv_size: int
     ) -> torch.Tensor:
-        return qkv_gemv(x, weight, threshold_q, threshold_k, threshold_v, sparsity_bin, kv_size) if x.shape[1] == 1 else torch.matmul(x, weight.T)
+        return qkv_gemv(x, weight, threshold_q, threshold_k, threshold_v, sparsity_bin, kv_size) if x.shape[1] == 1 else qkv_gemm(x, weight, threshold_q, threshold_k, threshold_v, sparsity_bin, kv_size)
+
 
 # for testing purposes, to see if overhead at 0% is really due to strengthening torch.matmul (seems like it is)
 class DenseGEMV(BaseKernel):
